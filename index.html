@@ -508,6 +508,111 @@ function fillGroup(template, days, monthThai, yearBE, monthIdx, topic, name){
   return s;
 }
 
+// For day-slots that don't exist in the month (e.g. day 30/31 in a shorter
+// month), the day-tracking table should show a fully blank column: no date
+// number, no "ลายมือชื่อผู้รับจ้าง" label, and no "งานที่มอบ"/"ส่งมอบ" headers —
+// matching the sample document's empty trailing columns.
+const WORDML_NS = 'http://schemas.openxmlformats.org/wordprocessingml/2006/main';
+
+function blankNullDaySlots(tableXml, days){
+  const wrapped = '<wrap xmlns:w="'+WORDML_NS+'" '+
+    'xmlns:w14="http://schemas.microsoft.com/office/word/2010/wordml" '+
+    'xmlns:w15="http://schemas.microsoft.com/office/word/2012/wordml">' +
+    tableXml + '</wrap>';
+  let doc;
+  try{
+    doc = new DOMParser().parseFromString(wrapped, 'application/xml');
+    if (doc.getElementsByTagName('parsererror').length) throw new Error('parse error');
+  }catch(e){
+    console.error('blankNullDaySlots: failed to parse table XML, leaving unmodified', e);
+    return tableXml;
+  }
+
+  const trs = doc.getElementsByTagName('w:tr');
+  for(let t=0; t<trs.length; t++){
+    const tr = trs[t];
+    let col = 0;
+    const tcs = [];
+    for(let c=0; c<tr.childNodes.length; c++){
+      const node = tr.childNodes[c];
+      if(node.nodeType === 1 && node.tagName === 'w:tc') tcs.push(node);
+    }
+    for(const tc of tcs){
+      let span = 1;
+      const tcPrList = tc.getElementsByTagName('w:tcPr');
+      if(tcPrList.length){
+        const gsList = tcPrList[0].getElementsByTagName('w:gridSpan');
+        if(gsList.length){
+          const v = gsList[0].getAttribute('w:val');
+          if(v) span = parseInt(v, 10) || 1;
+        }
+      }
+      const startCol = col;
+      col += span;
+      // Columns 0-1 are the fixed "ลำดับที่" / "งานที่มอบหมาย" columns.
+      // The remaining columns are grouped into 4 day-slots of 3 grid
+      // columns each.
+      if(startCol >= 2){
+        const slotIdx = Math.floor((startCol - 2) / 3);
+        if(slotIdx >= 0 && slotIdx < 4 && days[slotIdx] === null){
+          const ps = tc.getElementsByTagName('w:p');
+          for(let pi=0; pi<ps.length; pi++){
+            const p = ps[pi];
+            const runs = [];
+            for(let rc=0; rc<p.childNodes.length; rc++){
+              const rn = p.childNodes[rc];
+              if(rn.nodeType === 1 && rn.tagName === 'w:r') runs.push(rn);
+            }
+            for(const r of runs) p.removeChild(r);
+          }
+        }
+      }
+    }
+  }
+
+  const serialized = new XMLSerializer().serializeToString(doc.documentElement);
+  return serialized.replace(/^<wrap[^>]*>/, '').replace(/<\/wrap>$/, '');
+}
+
+// A group's page template can embed more than one copy of the day-tracking
+// table (the source document repeats the same day-group across several
+// physical Word pages). Every such table must be blanked, not just the
+// first one, so this walks all <w:tbl>...</w:tbl> blocks in the group and
+// only touches the ones that match the day-tracking table's signature
+// (identified by its fixed overall width), leaving the signature/committee
+// tables untouched.
+const DAY_TABLE_MARKER = 'tblW w:w="15478"';
+const TBL_OPEN = '<w:tbl>';
+const TBL_CLOSE = '</w:tbl>';
+
+function blankNullSlotsInGroup(groupXml, days){
+  if(!days.some(function(d){ return d === null; })) return groupXml;
+
+  let result = '';
+  let cursor = 0;
+  while(true){
+    const tblStart = groupXml.indexOf(TBL_OPEN, cursor);
+    if(tblStart === -1){
+      result += groupXml.slice(cursor);
+      break;
+    }
+    const tblEndIdx = groupXml.indexOf(TBL_CLOSE, tblStart);
+    if(tblEndIdx === -1){
+      // Malformed / unexpected structure — bail out safely with what's left untouched.
+      result += groupXml.slice(cursor);
+      break;
+    }
+    const tblEnd = tblEndIdx + TBL_CLOSE.length;
+    const tableXml = groupXml.slice(tblStart, tblEnd);
+    result += groupXml.slice(cursor, tblStart);
+    result += tableXml.indexOf(DAY_TABLE_MARKER) !== -1
+      ? blankNullDaySlots(tableXml, days)
+      : tableXml;
+    cursor = tblEnd;
+  }
+  return result;
+}
+
 function buildDocumentXML(daysCount, monthThai, yearBE, monthIdx, topic, name){
   const nGroups = Math.ceil(daysCount/4);
   let body = TPL_HEAD;
@@ -520,7 +625,8 @@ function buildDocumentXML(daysCount, monthThai, yearBE, monthIdx, topic, name){
     }
     const isLastGroup = (g === nGroups-1);
     const tpl = isLastGroup ? TPL_GROUP_LAST : TPL_GROUP;
-    body += fillGroup(tpl, days, monthThai, yearBE, monthIdx, topic, name);
+    const filledGroup = fillGroup(tpl, days, monthThai, yearBE, monthIdx, topic, name);
+    body += blankNullSlotsInGroup(filledGroup, days);
   }
   body += TPL_TAIL;
   return body;
